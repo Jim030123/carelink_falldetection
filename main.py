@@ -4,6 +4,7 @@ Real-time fall detection (camera/live) using YOLO + MediaPipe Pose.
 This script replaces the previous file-based pipeline and runs real-time detection from a camera by default.
 Usage:
   python main.py --source 0            # use camera 0
+  python main.py --source 0            # use camera 0
   python main.py --source in_video.mp4 # use a video file
   python main.py --source 0 --output out.mp4  # optionally save processed output
 Press 'q' in the OpenCV window to quit.
@@ -46,6 +47,11 @@ def main():
     parser.add_argument('--source', default='0', help='Camera index (0,1,...) or path to video file')
     parser.add_argument('--model', default='yolov8l.pt', help='YOLO model path')
     parser.add_argument('--output', default=None, help='Optional output file to save processed video')
+    # fall-detection tuning parameters
+    parser.add_argument('--lying-threshold', type=float, default=60.0, help='Torso angle (deg) above which is considered lying')
+    parser.add_argument('--ang-vel-threshold', type=float, default=150.0, help='Angular velocity threshold (deg/sec) to consider sudden fall')
+    parser.add_argument('--hip-vel-threshold', type=float, default=0.6, help='Hip vertical velocity threshold (fraction of frame height per second)')
+    parser.add_argument('--sustain-sec', type=float, default=0.2, help='Seconds the fall condition must sustain to trigger alert')
     args = parser.parse_args()
 
     source = to_source(args.source)
@@ -78,6 +84,11 @@ def main():
 
     falling_count = 0
     fall_detected = False
+    # temporal buffers for smoothing and velocity estimates
+    from collections import deque
+    angle_buf = deque(maxlen=10)
+    hip_y_buf = deque(maxlen=10)
+    t_buf = deque(maxlen=10)
     frame_counter = 0
     t0 = time.time()
 
@@ -126,19 +137,48 @@ def main():
                                 hip_center = ((hips[0][0] + hips[1][0]) / 2, (hips[0][1] + hips[1][1]) / 2)
 
                                 torso_angle = calculate_angle(hip_center, shoulder_center)
-                                posture = classify_posture(torso_angle)
+                                posture = classify_posture(torso_angle, standing_threshold=10, lying_threshold=args.lying_threshold)
 
+                                # compute global hip y (frame coordinates)
+                                hip_y_global = y1 + hip_center[1]
+                                now = time.time()
+
+                                # push to buffers
+                                angle_buf.append(torso_angle)
+                                hip_y_buf.append(hip_y_global)
+                                t_buf.append(now)
+
+                                # compute angular velocity and hip vertical velocity
+                                ang_vel = 0.0
+                                hip_vel = 0.0
+                                if len(angle_buf) >= 2:
+                                    dt = t_buf[-1] - t_buf[-2]
+                                    if dt > 1e-6:
+                                        ang_vel = (angle_buf[-1] - angle_buf[-2]) / dt
+                                        hip_vel = (hip_y_buf[-1] - hip_y_buf[-2]) / dt
+
+                                hip_vel_norm = hip_vel / float(height)
+
+                                # display metrics
                                 cv2.putText(frame, f'Posture: {posture}', (x1, max(0, y1-30)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
                                 cv2.putText(frame, f'Angle: {torso_angle:.1f}deg', (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2)
+                                cv2.putText(frame, f'AngVel: {ang_vel:.1f}d/s', (x1, max(0, y1-50)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
 
-                                if posture == 'Falling':
+                                ang_fall = abs(ang_vel) >= args.ang_vel_threshold
+                                hip_fall = hip_vel_norm >= args.hip_vel_threshold
+
+                                is_fall_frame = (posture == 'Falling' or torso_angle >= args.lying_threshold) and (ang_fall or hip_fall)
+
+                                # update falling_count using sustain frames logic
+                                if is_fall_frame:
                                     falling_count += 1
                                 else:
-                                    falling_count = 0
+                                    falling_count = max(0, falling_count - 1)
 
-                                if falling_count >= 0.1 * fps and falling_count <= 0.5 * fps:
+                                min_frames = max(1, int(args.sustain_sec * fps))
+                                if falling_count >= min_frames:
                                     fall_detected = True
-                                if posture == 'Standing':
+                                elif posture == 'Standing' and falling_count == 0:
                                     fall_detected = False
                             except Exception:
                                 pass
