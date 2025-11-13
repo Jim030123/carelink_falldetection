@@ -51,7 +51,11 @@ def main():
     parser.add_argument('--lying-threshold', type=float, default=60.0, help='Torso angle (deg) above which is considered lying')
     parser.add_argument('--ang-vel-threshold', type=float, default=150.0, help='Angular velocity threshold (deg/sec) to consider sudden fall')
     parser.add_argument('--hip-vel-threshold', type=float, default=0.6, help='Hip vertical velocity threshold (fraction of frame height per second)')
-    parser.add_argument('--sustain-sec', type=float, default=0.2, help='Seconds the fall condition must sustain to trigger alert')
+    parser.add_argument('--sustain-sec', type=float, default=3.0, help='Seconds the fall condition must sustain to trigger alert')
+    parser.add_argument('--clear-after', type=float, default=3.0, help='Seconds after which a detected fall status is cleared')
+    # direct fall (immediate) thresholds
+    parser.add_argument('--ang-vel-direct', type=float, default=400.0, help='Angular velocity (deg/sec) above which trigger immediate fall alert')
+    parser.add_argument('--hip-vel-direct', type=float, default=1.2, help='Hip vertical velocity (fraction of frame height/sec) above which trigger immediate fall alert')
     args = parser.parse_args()
 
     source = to_source(args.source)
@@ -89,6 +93,8 @@ def main():
     angle_buf = deque(maxlen=10)
     hip_y_buf = deque(maxlen=10)
     t_buf = deque(maxlen=10)
+    fall_start_time = None
+    clear_after = args.clear_after
     frame_counter = 0
     t0 = time.time()
 
@@ -100,6 +106,14 @@ def main():
                     break
 
                 frame_counter += 1
+
+                now = time.time()
+                # auto-clear fall_detected after clear_after seconds
+                if fall_detected and fall_start_time is not None:
+                    if now - fall_start_time >= clear_after:
+                        fall_detected = False
+                        falling_count = 0
+                        fall_start_time = None
 
                 results = model(frame)
 
@@ -167,19 +181,38 @@ def main():
                                 ang_fall = abs(ang_vel) >= args.ang_vel_threshold
                                 hip_fall = hip_vel_norm >= args.hip_vel_threshold
 
+                                # Direct (immediate) fall condition
+                                ang_direct = abs(ang_vel) >= args.ang_vel_direct
+                                hip_direct = hip_vel_norm >= args.hip_vel_direct
+
                                 is_fall_frame = (posture == 'Falling' or torso_angle >= args.lying_threshold) and (ang_fall or hip_fall)
 
-                                # update falling_count using sustain frames logic
-                                if is_fall_frame:
-                                    falling_count += 1
+                                # If a very sudden motion is observed, trigger immediate fall detection
+                                if ang_direct or hip_direct:
+                                    # immediate/direct fall detected
+                                    if not fall_detected:
+                                        fall_detected = True
+                                        fall_start_time = now
+                                    # boost falling_count so sustain logic keeps it active
+                                    min_frames = max(1, int(args.sustain_sec * fps))
+                                    falling_count = max(falling_count, min_frames)
+                                    # annotate immediate fall
+                                    cv2.putText(frame, 'DIRECT FALL!', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
                                 else:
-                                    falling_count = max(0, falling_count - 1)
+                                    # update falling_count using sustain frames logic
+                                    if is_fall_frame:
+                                        falling_count += 1
+                                    else:
+                                        falling_count = max(0, falling_count - 1)
 
-                                min_frames = max(1, int(args.sustain_sec * fps))
-                                if falling_count >= min_frames:
-                                    fall_detected = True
-                                elif posture == 'Standing' and falling_count == 0:
-                                    fall_detected = False
+                                    min_frames = max(1, int(args.sustain_sec * fps))
+                                    if falling_count >= min_frames:
+                                        if not fall_detected:
+                                            fall_detected = True
+                                            fall_start_time = now
+                                    elif posture == 'Standing' and falling_count == 0:
+                                        fall_detected = False
+                                        fall_start_time = None
                             except Exception:
                                 pass
 
