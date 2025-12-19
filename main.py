@@ -1,263 +1,285 @@
 """
-Real-time fall detection (camera/live) using YOLO + MediaPipe Pose.
+Real-time Fall Detection (RTSP Only)
+-----------------------------------
+RTSP CCTV
+→ YOLOv8 (person detection)
+→ MediaPipe Pose (fall detection)
+→ FFmpeg (RTMP)
+→ MediaMTX
+→ HLS (Flutter)
+→ FastAPI (/fall)
 
-This script replaces the previous file-based pipeline and runs real-time detection from a camera by default.
-Usage:
-  python main.py --source 0            # use camera 0
-  python main.py --source 0            # use camera 0
-  python main.py --source in_video.mp4 # use a video file
-  python main.py --source 0 --output out.mp4  # optionally save processed output
-Press 'q' in the OpenCV window to quit.
+Windows-ready, production-safe.
 """
 
 import math
 import time
-import argparse
-import numpy as np
+import threading
+import subprocess
+from collections import deque
+
 import cv2
+import numpy as np
 from ultralytics import YOLO
 import mediapipe as mp
 
+from fastapi import FastAPI
+import uvicorn
 
-def calculate_angle(shoulder_center, hip_center):
-    dy = shoulder_center[1] - hip_center[1]
-    dx = shoulder_center[0] - hip_center[0]
+# ======================================================
+# CONFIG
+# ======================================================
+
+# 🔴 CCTV RTSP (唯一视频来源)
+RTSP_URL = "rtsp://JJFAMILY:JJAN31237252@192.168.1.151:554/stream1"
+
+# 推到 MediaMTX（同一台电脑）
+RTMP_URL = "rtmp://127.0.0.1/cam1"
+
+# 处理 / 推流分辨率（稳定）
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+FPS = 20
+
+# ======================================================
+# FastAPI - Fall Event API
+# ======================================================
+app = FastAPI()
+
+fall_state = {
+    "fall_detected": False,
+    "timestamp": None
+}
+
+@app.get("/fall")
+def get_fall():
+    return fall_state
+
+
+def start_api():
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+
+
+# ======================================================
+# Helper Functions
+# ======================================================
+def calculate_angle(hip, shoulder):
+    dy = shoulder[1] - hip[1]
+    dx = shoulder[0] - hip[0]
     angle = math.atan2(dy, dx)
     return abs(90 - np.degrees(angle))
 
 
-def classify_posture(torso_angle, standing_threshold=10, lying_threshold=60):
-    if torso_angle < standing_threshold:
-        return "Standing"
-    elif torso_angle > lying_threshold:
-        return "Lying Down"
-    else:
-        return "Falling"
-
-
-def to_source(val):
-    try:
-        return int(val)
-    except Exception:
-        return val
-
-
+# ======================================================
+# Main
+# ======================================================
 def main():
-    parser = argparse.ArgumentParser(description='Real-time fall detection (YOLO + MediaPipe)')
-    parser.add_argument('--source', default='0', help='Camera index (0,1,...) or path to video file')
-    parser.add_argument('--model', default='yolov8l.pt', help='YOLO model path')
-    parser.add_argument('--output', default=None, help='Optional output file to save processed video')
-    # fall-detection tuning parameters
-    parser.add_argument('--lying-threshold', type=float, default=60.0, help='Torso angle (deg) above which is considered lying')
-    parser.add_argument('--ang-vel-threshold', type=float, default=150.0, help='Angular velocity threshold (deg/sec) to consider sudden fall')
-    parser.add_argument('--hip-vel-threshold', type=float, default=0.6, help='Hip vertical velocity threshold (fraction of frame height per second)')
-    parser.add_argument('--sustain-sec', type=float, default=3.0, help='Seconds the fall condition must sustain to trigger alert')
-    parser.add_argument('--clear-after', type=float, default=3.0, help='Seconds after which a detected fall status is cleared')
-    # direct fall (immediate) thresholds
-    parser.add_argument('--ang-vel-direct', type=float, default=400.0, help='Angular velocity (deg/sec) above which trigger immediate fall alert')
-    parser.add_argument('--hip-vel-direct', type=float, default=1.2, help='Hip vertical velocity (fraction of frame height/sec) above which trigger immediate fall alert')
-    parser.add_argument('--direct-only', action='store_true', help='Only trigger on immediate/direct thresholds; ignore sustained detection')
-    args = parser.parse_args()
+    # --------------------------------------------------
+    # Start HTTP API
+    # --------------------------------------------------
+    threading.Thread(target=start_api, daemon=True).start()
 
-    source = to_source(args.source)
-
-    print('Loading model...', args.model)
-    model = YOLO(args.model)
+    # --------------------------------------------------
+    # Load Models
+    # --------------------------------------------------
+    print("Loading YOLO model...")
+    model = YOLO("yolov8l.pt")
 
     mp_pose = mp.solutions.pose
-    mp_drawing = mp.solutions.drawing_utils
+    mp_draw = mp.solutions.drawing_utils
 
-    cap = cv2.VideoCapture(source)
+    # --------------------------------------------------
+    # Open RTSP (Force TCP, Low Buffer)
+    # --------------------------------------------------
+    rtsp = RTSP_URL + "?rtsp_transport=tcp&stimeout=5000000"
+
+    cap = cv2.VideoCapture(rtsp, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
     if not cap.isOpened():
-        print('ERROR: cannot open source', source)
+        print("❌ ERROR: Cannot open RTSP stream")
         return
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+    print("RTSP connected")
 
-    writer = None
-    if args.output:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
-        if not writer.isOpened():
-            print('WARNING: could not open video writer for', args.output)
-            writer = None
+    # --------------------------------------------------
+    # FFmpeg → MediaMTX (RTMP)
+    # --------------------------------------------------
+    ffmpeg = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-re",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
 
-    window = 'Fall Detection - press q to quit'
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+            "-r", str(FPS),
+            "-i", "-",
 
-    falling_count = 0
-    fall_detected = False
-    # temporal buffers for smoothing and velocity estimates
-    from collections import deque
+            "-vf", "format=yuv420p",
+            "-c:v", "libx264",
+            "-profile:v", "baseline",
+            "-level", "3.1",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            "-g", "40",
+
+            "-f", "flv",
+            RTMP_URL,
+        ],
+        stdin=subprocess.PIPE
+    )
+
+    # --------------------------------------------------
+    # Fall Detection State
+    # --------------------------------------------------
     angle_buf = deque(maxlen=10)
     hip_y_buf = deque(maxlen=10)
     t_buf = deque(maxlen=10)
-    fall_start_time = None
-    clear_after = args.clear_after
-    frame_counter = 0
-    t0 = time.time()
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    fall_detected = False
+    fall_start_time = None
+    CLEAR_AFTER = 3.0
+
+    # Thresholds
+    ANG_VEL_DIRECT = 400.0
+    HIP_VEL_DIRECT = 1.2
+
+    # --------------------------------------------------
+    # Pose Pipeline
+    # --------------------------------------------------
+    with mp_pose.Pose(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as pose:
+
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    break
-
-                frame_counter += 1
+                    print("⚠️ RTSP frame lost, retrying...")
+                    time.sleep(0.2)
+                    continue
 
                 now = time.time()
-                # auto-clear fall_detected after clear_after seconds
-                if fall_detected and fall_start_time is not None:
-                    if now - fall_start_time >= clear_after:
+
+                # Auto clear fall
+                if fall_detected and fall_start_time:
+                    if now - fall_start_time >= CLEAR_AFTER:
                         fall_detected = False
-                        falling_count = 0
+                        fall_state["fall_detected"] = False
+                        fall_state["timestamp"] = None
                         fall_start_time = None
 
-                results = model(frame)
+                # ------------------------------
+                # YOLO: detect person
+                # ------------------------------
+                results = model(frame, verbose=False)
 
                 for result in results:
-                    for bbox, cls in zip(result.boxes.xyxy, result.boxes.cls):
+                    for box, cls in zip(result.boxes.xyxy, result.boxes.cls):
                         if int(cls) != 0:
+                            continue  # only person
+
+                        x1, y1, x2, y2 = map(int, box)
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+
+                        person = frame[y1:y2, x1:x2]
+                        if person.size == 0:
                             continue
-                        x1, y1, x2, y2 = map(int, bbox)
-                        x1 = max(0, x1); y1 = max(0, y1)
-                        x2 = min(frame.shape[1]-1, x2); y2 = min(frame.shape[0]-1, y2)
 
-                        person_bbox = frame[y1:y2, x1:x2]
-                        if person_bbox.size == 0:
+                        rgb = cv2.cvtColor(person, cv2.COLOR_BGR2RGB)
+                        res = pose.process(rgb)
+                        if not res.pose_landmarks:
                             continue
 
-                        person_rgb = cv2.cvtColor(person_bbox, cv2.COLOR_BGR2RGB)
-                        person_results = pose.process(person_rgb)
+                        mp_draw.draw_landmarks(
+                            person,
+                            res.pose_landmarks,
+                            mp_pose.POSE_CONNECTIONS
+                        )
 
-                        if person_results.pose_landmarks:
-                            mp_drawing.draw_landmarks(person_bbox, person_results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                        lm = res.pose_landmarks.landmark
 
-                            # compute simple torso angle using shoulders and hips if available
-                            try:
-                                landmarks = person_results.pose_landmarks.landmark
-                                shoulders = [
-                                    (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * person_bbox.shape[1], landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * person_bbox.shape[0]),
-                                    (landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x * person_bbox.shape[1], landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y * person_bbox.shape[0])
-                                ]
-                                hips = [
-                                    (landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * person_bbox.shape[1], landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y * person_bbox.shape[0]),
-                                    (landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * person_bbox.shape[1], landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y * person_bbox.shape[0])
-                                ]
+                        sh_l = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                        sh_r = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                        hp_l = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
+                        hp_r = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
 
-                                shoulder_center = ((shoulders[0][0] + shoulders[1][0]) / 2, (shoulders[0][1] + shoulders[1][1]) / 2)
-                                hip_center = ((hips[0][0] + hips[1][0]) / 2, (hips[0][1] + hips[1][1]) / 2)
+                        shoulder = (
+                            (sh_l.x + sh_r.x) * person.shape[1] / 2,
+                            (sh_l.y + sh_r.y) * person.shape[0] / 2
+                        )
+                        hip = (
+                            (hp_l.x + hp_r.x) * person.shape[1] / 2,
+                            (hp_l.y + hp_r.y) * person.shape[0] / 2
+                        )
 
-                                torso_angle = calculate_angle(hip_center, shoulder_center)
-                                posture = classify_posture(torso_angle, standing_threshold=10, lying_threshold=args.lying_threshold)
+                        angle = calculate_angle(hip, shoulder)
+                        hip_y = y1 + hip[1]
 
-                                # compute global hip y (frame coordinates)
-                                hip_y_global = y1 + hip_center[1]
-                                now = time.time()
+                        angle_buf.append(angle)
+                        hip_y_buf.append(hip_y)
+                        t_buf.append(now)
 
-                                # push to buffers
-                                angle_buf.append(torso_angle)
-                                hip_y_buf.append(hip_y_global)
-                                t_buf.append(now)
+                        ang_vel = hip_vel = 0.0
+                        if len(angle_buf) >= 2:
+                            dt = t_buf[-1] - t_buf[-2]
+                            if dt > 1e-6:
+                                ang_vel = (angle_buf[-1] - angle_buf[-2]) / dt
+                                hip_vel = (hip_y_buf[-1] - hip_y_buf[-2]) / dt
 
-                                # compute angular velocity and hip vertical velocity
-                                ang_vel = 0.0
-                                hip_vel = 0.0
-                                if len(angle_buf) >= 2:
-                                    dt = t_buf[-1] - t_buf[-2]
-                                    if dt > 1e-6:
-                                        ang_vel = (angle_buf[-1] - angle_buf[-2]) / dt
-                                        hip_vel = (hip_y_buf[-1] - hip_y_buf[-2]) / dt
+                        hip_vel_norm = hip_vel / FRAME_HEIGHT
 
-                                hip_vel_norm = hip_vel / float(height)
+                        # ------------------------------
+                        # Direct Fall Detection
+                        # ------------------------------
+                        if (
+                            abs(ang_vel) >= ANG_VEL_DIRECT
+                            or hip_vel_norm >= HIP_VEL_DIRECT
+                        ):
+                            if not fall_detected:
+                                fall_detected = True
+                                fall_start_time = now
+                                fall_state["fall_detected"] = True
+                                fall_state["timestamp"] = now
 
-                                # display metrics
-                                cv2.putText(frame, f'Posture: {posture}', (x1, max(0, y1-30)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
-                                cv2.putText(frame, f'Angle: {torso_angle:.1f}deg', (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2)
-                                cv2.putText(frame, f'AngVel: {ang_vel:.1f}d/s', (x1, max(0, y1-50)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
-
-                                ang_fall = abs(ang_vel) >= args.ang_vel_threshold
-                                hip_fall = hip_vel_norm >= args.hip_vel_threshold
-
-                                # Direct (immediate) fall condition
-                                ang_direct = abs(ang_vel) >= args.ang_vel_direct
-                                hip_direct = hip_vel_norm >= args.hip_vel_direct
-
-                                is_fall_frame = (posture == 'Falling' or torso_angle >= args.lying_threshold) and (ang_fall or hip_fall)
-
-                                # If a very sudden motion is observed, trigger immediate fall detection
-                                if ang_direct or hip_direct:
-                                    # immediate/direct fall detected
-                                    if not fall_detected:
-                                        fall_detected = True
-                                        fall_start_time = now
-                                    # If not in direct-only mode, also boost falling_count so sustain logic keeps it active
-                                    if not args.direct_only:
-                                        min_frames = max(1, int(args.sustain_sec * fps))
-                                        falling_count = max(falling_count, min_frames)
-                                    # annotate immediate fall
-                                    cv2.putText(frame, 'DIRECT FALL!', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
-                                else:
-                                    if args.direct_only:
-                                        # In direct-only mode we do not use sustained detection
-                                        falling_count = 0
-                                    else:
-                                        # update falling_count using sustain frames logic
-                                        if is_fall_frame:
-                                            falling_count += 1
-                                        else:
-                                            falling_count = max(0, falling_count - 1)
-
-                                        min_frames = max(1, int(args.sustain_sec * fps))
-                                        if falling_count >= min_frames:
-                                            if not fall_detected:
-                                                fall_detected = True
-                                                fall_start_time = now
-                                        elif posture == 'Standing' and falling_count == 0:
-                                            fall_detected = False
-                                            fall_start_time = None
-                            except Exception:
-                                pass
-
-                        frame[y1:y2, x1:x2] = person_bbox
+                        frame[y1:y2, x1:x2] = person
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-                # alert text
                 if fall_detected:
-                    cv2.putText(frame, 'FALL DETECTED', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
+                    cv2.putText(
+                        frame,
+                        "FALL DETECTED",
+                        (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2,
+                        (0, 0, 255),
+                        3
+                    )
 
-                # FPS display (simple)
-                if frame_counter % 10 == 0:
-                    t1 = time.time()
-                    fps_disp = 10.0 / max(1e-6, (t1 - t0))
-                    t0 = t1
+                # ------------------------------
+                # Push frame to FFmpeg
+                # ------------------------------
                 try:
-                    fps_disp
-                except NameError:
-                    fps_disp = fps
-                cv2.putText(frame, f'FPS: {fps_disp:.1f}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-
-                cv2.imshow(window, frame)
-
-                if writer:
-                    writer.write(frame)
-
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    ffmpeg.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    print("❌ FFmpeg disconnected")
                     break
 
         except KeyboardInterrupt:
-            print('Interrupted by user')
+            print("Stopping...")
 
     cap.release()
-    if writer:
-        writer.release()
-    cv2.destroyAllWindows()
+    ffmpeg.stdin.close()
+    ffmpeg.wait()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-
