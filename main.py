@@ -56,6 +56,7 @@ def main():
     # direct fall (immediate) thresholds
     parser.add_argument('--ang-vel-direct', type=float, default=400.0, help='Angular velocity (deg/sec) above which trigger immediate fall alert')
     parser.add_argument('--hip-vel-direct', type=float, default=1.2, help='Hip vertical velocity (fraction of frame height/sec) above which trigger immediate fall alert')
+    parser.add_argument('--direct-only', action='store_true', help='Only trigger on immediate/direct thresholds; ignore sustained detection')
     args = parser.parse_args()
 
     source = to_source(args.source)
@@ -193,26 +194,31 @@ def main():
                                     if not fall_detected:
                                         fall_detected = True
                                         fall_start_time = now
-                                    # boost falling_count so sustain logic keeps it active
-                                    min_frames = max(1, int(args.sustain_sec * fps))
-                                    falling_count = max(falling_count, min_frames)
+                                    # If not in direct-only mode, also boost falling_count so sustain logic keeps it active
+                                    if not args.direct_only:
+                                        min_frames = max(1, int(args.sustain_sec * fps))
+                                        falling_count = max(falling_count, min_frames)
                                     # annotate immediate fall
                                     cv2.putText(frame, 'DIRECT FALL!', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
                                 else:
-                                    # update falling_count using sustain frames logic
-                                    if is_fall_frame:
-                                        falling_count += 1
+                                    if args.direct_only:
+                                        # In direct-only mode we do not use sustained detection
+                                        falling_count = 0
                                     else:
-                                        falling_count = max(0, falling_count - 1)
+                                        # update falling_count using sustain frames logic
+                                        if is_fall_frame:
+                                            falling_count += 1
+                                        else:
+                                            falling_count = max(0, falling_count - 1)
 
-                                    min_frames = max(1, int(args.sustain_sec * fps))
-                                    if falling_count >= min_frames:
-                                        if not fall_detected:
-                                            fall_detected = True
-                                            fall_start_time = now
-                                    elif posture == 'Standing' and falling_count == 0:
-                                        fall_detected = False
-                                        fall_start_time = None
+                                        min_frames = max(1, int(args.sustain_sec * fps))
+                                        if falling_count >= min_frames:
+                                            if not fall_detected:
+                                                fall_detected = True
+                                                fall_start_time = now
+                                        elif posture == 'Standing' and falling_count == 0:
+                                            fall_detected = False
+                                            fall_start_time = None
                             except Exception:
                                 pass
 
