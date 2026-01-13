@@ -5,12 +5,12 @@ import time
 # =========================
 # CCTV RTSP URL
 # =========================
-RTSP_URL = "rtsp://JJFAMILY:JJAN31237252@192.168.1.151:554/stream1"
+RTSP_URL = "rtsp://JJFAMILY:JJAN31237252@180.73.175.191:554/stream1"
 
 # =========================
 # MediaMTX RTMP path
 # =========================
-RTMP_URL = "rtmp://127.0.0.1/cam1"
+RTMP_URL = "rtmp://127.0.0.1/cam2"
 
 # =========================
 # Open RTSP via OpenCV
@@ -52,7 +52,7 @@ ffmpeg = subprocess.Popen(
         "-tune", "zerolatency",
 
         "-f", "flv",
-        "rtmp://127.0.0.1/cam1",
+        "rtmp://127.0.0.1/cam2",
     ],
     stdin=subprocess.PIPE
 )
